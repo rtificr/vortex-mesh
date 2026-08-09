@@ -10,4 +10,4 @@ description = "Converts .obj files to Vortex parts."
 clap = { version = "4.5", features = ["derive"] }
 glam = "0.33.3"
 tobj = "4.0.5"
-vortex-project = "1.0.0"
+vortex-project = "1.0.1"
