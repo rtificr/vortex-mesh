@@ -1,8 +1,8 @@
 use std::{cmp::Ordering, collections::BinaryHeap, error::Error, fmt, path::PathBuf, process};
 
 use clap::Parser;
-use glam::{DVec4, Mat3, Quat, Vec3, vec3};
-use vortex_project::{PartTransform, Project};
+use glam::{DVec4, Mat3, Quat, Vec2, Vec3, vec3};
+use vortex_project::{Group, GroupId, Part, Project};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BoxTransform {
@@ -14,6 +14,8 @@ pub struct BoxTransform {
 #[derive(Debug)]
 pub enum MeshToBoxesError {
     InvalidIndexCount,
+    InvalidFaceLayout,
+    NonTriangulableFace,
     NonPositiveTolerance,
     IndexOutOfBounds { index: u32, vertex_count: usize },
 }
@@ -24,6 +26,10 @@ impl fmt::Display for MeshToBoxesError {
             Self::InvalidIndexCount => {
                 write!(formatter, "mesh indices must be a multiple of three")
             }
+            Self::InvalidFaceLayout => {
+                write!(formatter, "mesh face arities do not match its indices")
+            }
+            Self::NonTriangulableFace => write!(formatter, "mesh contains a non-triangulable face"),
             Self::NonPositiveTolerance => {
                 write!(formatter, "surface-error tolerance must be positive")
             }
@@ -36,6 +42,209 @@ impl fmt::Display for MeshToBoxesError {
             ),
         }
     }
+}
+
+fn polygon_faces_to_boxes(
+    vertices: &[Vec3],
+    indices: &[u32],
+    face_arities: &[u32],
+) -> Result<(Vec<BoxTransform>, Vec<u32>), MeshToBoxesError> {
+    let arities: Vec<u32> = if face_arities.is_empty() {
+        if !indices.len().is_multiple_of(3) {
+            return Err(MeshToBoxesError::InvalidIndexCount);
+        }
+        vec![3; indices.len() / 3]
+    } else {
+        face_arities.to_vec()
+    };
+
+    let mut direct_boxes = Vec::new();
+    let mut triangle_indices = Vec::new();
+    let mut cursor = 0;
+
+    for arity in arities {
+        let arity = arity as usize;
+        if arity < 3 || cursor + arity > indices.len() {
+            return Err(MeshToBoxesError::InvalidFaceLayout);
+        }
+
+        let face = &indices[cursor..cursor + arity];
+        for &index in face {
+            if index as usize >= vertices.len() {
+                return Err(MeshToBoxesError::IndexOutOfBounds {
+                    index,
+                    vertex_count: vertices.len(),
+                });
+            }
+        }
+
+        if arity == 4 {
+            let quad = [
+                vertices[face[0] as usize],
+                vertices[face[1] as usize],
+                vertices[face[2] as usize],
+                vertices[face[3] as usize],
+            ];
+            if is_rectangular_quad(quad) {
+                direct_boxes.push(quad_box(quad));
+                cursor += arity;
+                continue;
+            }
+        }
+
+        triangle_indices.extend(triangulate_face(vertices, face)?);
+        cursor += arity;
+    }
+
+    if cursor != indices.len() {
+        return Err(MeshToBoxesError::InvalidFaceLayout);
+    }
+
+    Ok((direct_boxes, triangle_indices))
+}
+
+fn is_rectangular_quad([a, b, c, d]: [Vec3; 4]) -> bool {
+    let ab = b - a;
+    let bc = c - b;
+    let cd = d - c;
+    let da = a - d;
+    let longest_edge = ab
+        .length()
+        .max(bc.length())
+        .max(cd.length())
+        .max(da.length());
+    if longest_edge <= 1e-6 {
+        return false;
+    }
+
+    let normal = ab.cross(bc);
+    if normal.length_squared() <= 1e-12 {
+        return false;
+    }
+
+    let tolerance = longest_edge * 1e-3;
+    let unit_normal = normal.normalize();
+    (d - a).dot(unit_normal).abs() <= tolerance
+        && ab.dot(bc).abs() <= ab.length() * bc.length() * 1e-3
+        && ab.cross(cd).length() <= ab.length() * cd.length() * 1e-3
+        && bc.cross(da).length() <= bc.length() * da.length() * 1e-3
+}
+
+fn quad_box([a, b, c, d]: [Vec3; 4]) -> BoxTransform {
+    fit_obb(&[
+        Triangle {
+            vertices: [a, b, c],
+            weight: 1.0,
+        },
+        Triangle {
+            vertices: [a, c, d],
+            weight: 1.0,
+        },
+    ])
+}
+
+fn triangulate_face(vertices: &[Vec3], face: &[u32]) -> Result<Vec<u32>, MeshToBoxesError> {
+    if face.len() == 3 {
+        return Ok(face.to_vec());
+    }
+
+    let points: Vec<Vec3> = face.iter().map(|&index| vertices[index as usize]).collect();
+    let normal = polygon_normal(&points);
+    if normal.length_squared() <= 1e-12 {
+        return Err(MeshToBoxesError::NonTriangulableFace);
+    }
+
+    let projected: Vec<Vec2> = points
+        .iter()
+        .map(|&point| project_polygon_point(point, normal))
+        .collect();
+    let signed_area = polygon_signed_area(&projected);
+    if signed_area.abs() <= 1e-8 {
+        return Err(MeshToBoxesError::NonTriangulableFace);
+    }
+
+    let winding = signed_area.signum();
+    let mut remaining: Vec<usize> = (0..face.len()).collect();
+    let mut triangles = Vec::with_capacity((face.len() - 2) * 3);
+
+    while remaining.len() > 3 {
+        let mut ear_found = false;
+
+        for current_position in 0..remaining.len() {
+            let previous = remaining[(current_position + remaining.len() - 1) % remaining.len()];
+            let current = remaining[current_position];
+            let next = remaining[(current_position + 1) % remaining.len()];
+            let a = projected[previous];
+            let b = projected[current];
+            let c = projected[next];
+
+            if cross_2d(b - a, c - b) * winding <= 1e-8 {
+                continue;
+            }
+            if remaining.iter().copied().any(|candidate| {
+                candidate != previous
+                    && candidate != current
+                    && candidate != next
+                    && point_in_triangle(projected[candidate], a, b, c, winding)
+            }) {
+                continue;
+            }
+
+            triangles.extend([face[previous], face[current], face[next]]);
+            remaining.remove(current_position);
+            ear_found = true;
+            break;
+        }
+
+        if !ear_found {
+            return Err(MeshToBoxesError::NonTriangulableFace);
+        }
+    }
+
+    triangles.extend([face[remaining[0]], face[remaining[1]], face[remaining[2]]]);
+    Ok(triangles)
+}
+
+fn polygon_normal(points: &[Vec3]) -> Vec3 {
+    let mut normal = Vec3::ZERO;
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+    normal
+}
+
+fn project_polygon_point(point: Vec3, normal: Vec3) -> Vec2 {
+    let absolute_normal = normal.abs();
+    if absolute_normal.x >= absolute_normal.y && absolute_normal.x >= absolute_normal.z {
+        Vec2::new(point.y, point.z)
+    } else if absolute_normal.y >= absolute_normal.z {
+        Vec2::new(point.x, point.z)
+    } else {
+        Vec2::new(point.x, point.y)
+    }
+}
+
+fn polygon_signed_area(points: &[Vec2]) -> f32 {
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, &point)| cross_2d(point, points[(index + 1) % points.len()]))
+        .sum::<f32>()
+        * 0.5
+}
+
+fn cross_2d(a: Vec2, b: Vec2) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
+fn point_in_triangle(point: Vec2, a: Vec2, b: Vec2, c: Vec2, winding: f32) -> bool {
+    cross_2d(b - a, point - a) * winding >= -1e-8
+        && cross_2d(c - b, point - b) * winding >= -1e-8
+        && cross_2d(a - c, point - c) * winding >= -1e-8
 }
 
 impl Error for MeshToBoxesError {}
@@ -143,7 +352,7 @@ pub fn mesh_to_boxes(
         // A box is final only when its surface closely follows the mesh. This
         // keeps an exact cube as one part while refining curved, concave, and
         // partially filled bounding boxes.
-        if cluster.surface_error <= max_surface_error {
+        if cluster.surface_error <= max_surface_error || cluster.triangles.len() == 1 {
             finalized_weight += cluster
                 .triangles
                 .iter()
@@ -204,11 +413,6 @@ fn make_cluster(triangles: Vec<Triangle>) -> Cluster {
 }
 
 fn split_cluster(cluster: Cluster) -> (Cluster, Cluster) {
-    if cluster.triangles.len() == 1 {
-        let [left, right] = split_triangle(cluster.triangles.into_iter().next().unwrap());
-        return (make_cluster(vec![left]), make_cluster(vec![right]));
-    }
-
     let axes = Mat3::from_quat(cluster.obb.rotation);
 
     // Split along the longest dimension of the current box.
@@ -242,51 +446,6 @@ fn split_cluster(cluster: Cluster) -> (Cluster, Cluster) {
     let left = triangles;
 
     (make_cluster(left), make_cluster(right))
-}
-
-fn split_triangle(triangle: Triangle) -> [Triangle; 2] {
-    let [a, b, c] = triangle.vertices;
-    let ab = a.distance_squared(b);
-    let bc = b.distance_squared(c);
-    let ca = c.distance_squared(a);
-
-    if ab >= bc && ab >= ca {
-        let midpoint = (a + b) * 0.5;
-        [
-            Triangle {
-                vertices: [a, midpoint, c],
-                weight: triangle.weight * 0.5,
-            },
-            Triangle {
-                vertices: [midpoint, b, c],
-                weight: triangle.weight * 0.5,
-            },
-        ]
-    } else if bc >= ca {
-        let midpoint = (b + c) * 0.5;
-        [
-            Triangle {
-                vertices: [b, midpoint, a],
-                weight: triangle.weight * 0.5,
-            },
-            Triangle {
-                vertices: [midpoint, c, a],
-                weight: triangle.weight * 0.5,
-            },
-        ]
-    } else {
-        let midpoint = (c + a) * 0.5;
-        [
-            Triangle {
-                vertices: [c, midpoint, b],
-                weight: triangle.weight * 0.5,
-            },
-            Triangle {
-                vertices: [midpoint, a, b],
-                weight: triangle.weight * 0.5,
-            },
-        ]
-    }
 }
 
 fn fit_obb(triangles: &[Triangle]) -> BoxTransform {
@@ -561,6 +720,9 @@ struct Cli {
     #[arg(short, long, visible_alias = "merror", default_value_t = 0.01, value_parser = parse_positive_f32)]
     max_relative_surface_error: f32,
 
+    #[arg(long, default_value_t = 0.05, value_parser = parse_positive_f32)]
+    min_thickness: f32,
+
     #[arg(long, default_value = "FF0000", value_parser = parse_color)]
     color: DVec4,
 
@@ -627,6 +789,11 @@ fn vec3_argument(values: Option<&[f32]>, default: Vec3) -> Vec3 {
     }
 }
 
+fn enforce_minimum_thickness(mut part: BoxTransform, min_thickness: f32) -> BoxTransform {
+    part.scale = part.scale.max(Vec3::splat(min_thickness));
+    part
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -640,7 +807,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let position = vec3_argument(cli.position.as_deref(), Vec3::ZERO);
     let scale = vec3_argument(cli.scale.as_deref(), Vec3::ONE);
 
-    let (models, _) = tobj::load_obj(&path, &tobj::GPU_LOAD_OPTIONS)?;
+    let load_options = tobj::LoadOptions {
+        triangulate: false,
+        ..tobj::GPU_LOAD_OPTIONS
+    };
+    let (models, _) = tobj::load_obj(&path, &load_options)?;
     eprintln!("Loaded {} mesh(es).", models.len());
 
     let mut parts = vec![];
@@ -655,13 +826,26 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err("mesh position data must be a multiple of three".into());
         }
         let indices = model.mesh.indices;
+        let face_arities = model.mesh.face_arities;
 
         eprintln!(
             "Converting mesh {} ({} triangles)...",
             model_index + 1,
-            indices.len() / 3
+            face_arities.len().max(indices.len() / 3)
         );
-        let boxes = mesh_to_boxes(vec3s.as_slice(), &indices, cli.max_relative_surface_error)?;
+        let (mut boxes, triangle_indices) =
+            polygon_faces_to_boxes(vec3s.as_slice(), &indices, &face_arities)?;
+        if !triangle_indices.is_empty() {
+            boxes.extend(mesh_to_boxes(
+                vec3s.as_slice(),
+                &triangle_indices,
+                cli.max_relative_surface_error,
+            )?);
+        }
+        boxes = boxes
+            .into_iter()
+            .map(|part| enforce_minimum_thickness(part, cli.min_thickness))
+            .collect();
         eprintln!(
             "Mesh {} contributed {} parts.",
             model_index + 1,
@@ -674,14 +858,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(existing_project) => Project::load(existing_project)?,
         None => Project::new(),
     };
-    project.add_parts(parts.into_iter().map(|part| PartTransform {
+    let group = Group {
+        name: path.file_stem().unwrap().to_string_lossy().to_string(),
+        parent_group: None,
+    };
+    let group_id = GroupId(project.groups.len());
+    project.groups.push(group);
+    project.parts.extend(parts.into_iter().map(|part| Part {
         position: part.position.as_dvec3() + position.as_dvec3(),
         rotation: part.rotation.as_dquat(),
         scale: part.scale.as_dvec3(),
         color: cli.color,
         material: cli.material.clone(),
+        group: Some(group_id),
+        ..Default::default()
     }));
-
     let output = match cli.output {
         Some(output) => output,
         None => cli.project.unwrap_or_else(|| path.with_extension("json")),
@@ -710,6 +901,20 @@ mod tests {
     }
 
     #[test]
+    fn enforces_minimum_part_thickness() {
+        let part = enforce_minimum_thickness(
+            BoxTransform {
+                position: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                scale: vec3(3.0, 0.0, 0.001),
+            },
+            0.05,
+        );
+
+        assert_eq!(part.scale, vec3(3.0, 0.05, 0.05));
+    }
+
+    #[test]
     fn keeps_a_planar_rectangle_as_one_part() {
         // Four triangles in the Z=0 plane. Every fitted box has zero volume,
         // which used to make the first split fail the volume-gain check.
@@ -735,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn subdivides_a_poorly_fitting_triangle() {
+    fn does_not_subdivide_a_single_triangle() {
         let vertices = [
             vec3(0.0, 0.0, 0.0),
             vec3(1.0, 0.0, 0.0),
@@ -744,7 +949,37 @@ mod tests {
         let indices: Vec<u32> = (0..3).collect();
         let boxes = mesh_to_boxes(&vertices, &indices, 0.01).unwrap();
 
-        assert!(boxes.len() > 1);
+        assert_eq!(boxes.len(), 1);
+    }
+
+    #[test]
+    fn preserves_rectangular_quads_as_single_boxes() {
+        let vertices = [
+            vec3(-1.0, -1.0, 0.0),
+            vec3(1.0, -1.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+            vec3(-1.0, 1.0, 0.0),
+        ];
+
+        let (boxes, triangles) = polygon_faces_to_boxes(&vertices, &[0, 1, 2, 3], &[4]).unwrap();
+
+        assert_eq!(boxes.len(), 1);
+        assert!(triangles.is_empty());
+    }
+
+    #[test]
+    fn triangulates_non_rectangular_quads_once() {
+        let vertices = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(2.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+        ];
+
+        let (boxes, triangles) = polygon_faces_to_boxes(&vertices, &[0, 1, 2, 3], &[4]).unwrap();
+
+        assert!(boxes.is_empty());
+        assert_eq!(triangles.len(), 6);
     }
 
     #[test]

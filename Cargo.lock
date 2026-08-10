@@ -391,7 +391,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vortex-mesh"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "glam",
@@ -401,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "vortex-project"
-version = "1.0.1"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae0a6d2177ae740cb3c91f5b9b2b098187f9faaca199e6c19724f207ea89ec3e"
+checksum = "6e4ae95ce63d4bea3e8eb84bcec045b166993c5ed38f96f64cb20102fd17ac23"
 dependencies = [
  "glam",
  "serde",
